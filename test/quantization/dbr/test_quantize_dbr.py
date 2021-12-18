@@ -1,6 +1,7 @@
 import collections
 import copy
 import math
+import tempfile
 import unittest
 
 import torch
@@ -1122,6 +1123,46 @@ class TestQuantizeDBR(QuantizeDBRTestCase):
         self.assertTrue(isinstance(mq[2][0], nn.Conv2d))
         self.assertTrue(isinstance(mq[2][1], nnq.Conv2d))
 
+    def test_serialization(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = torch.nn.Conv2d(1, 1, 1)
+                self.linear = torch.nn.Linear(1, 1)
+
+            def forward(self, x):
+                x1 = self.conv(x)
+                x2 = self.linear(x1)
+                return x2
+
+        input_shape = (1, 1, 1, 1)
+        qconfig_dict = {'': torch.quantization.default_qconfig}
+        example_inputs = (torch.randn(*input_shape),)
+
+        m = M().eval()
+        m = _quantize_dbr.prepare(m, qconfig_dict, example_inputs)
+        m = _quantize_dbr.convert(m)
+        m_copy = copy.deepcopy(m)
+
+        # Ensure the two models have different weights
+        conv_qweight = torch._empty_affine_quantized(input_shape, scale=100, zero_point=50, dtype=torch.qint8)
+        linear_qweight = torch._empty_affine_quantized([1, 1], scale=200, zero_point=25, dtype=torch.qint8)
+        m_copy.conv.set_weight_bias(conv_qweight, torch.zeros(1))
+        m_copy.linear.set_weight_bias(linear_qweight, torch.zeros(1))
+
+        # Results should be different without loading from serialized state_dict
+        expected = m(example_inputs[0])
+        actual = m_copy(example_inputs[0])
+        self.assertFalse(_allclose(expected, actual))
+
+        # Results should be the same after loading from serialized state_dict
+        with tempfile.NamedTemporaryFile() as f:
+            torch.save(m.state_dict(), f.name)
+            loaded_state_dict = torch.load(f.name)
+            m_copy.load_state_dict(loaded_state_dict)
+        expected = m(example_inputs[0])
+        actual = m_copy(example_inputs[0])
+        self.assertTrue(_allclose(expected, actual))
 
 @skipIfNoFBGEMM
 class TestQuantizeDBRModels(QuantizeDBRTestCase):
